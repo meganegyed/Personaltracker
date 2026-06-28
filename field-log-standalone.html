@@ -30,11 +30,15 @@
   .display { font-family:'Playfair Display', serif; font-style: italic; }
   .mono { font-family:'IBM Plex Mono', monospace; }
   .px4 { padding-left:16px; padding-right:16px; }
-  .header { padding: 24px 20px 12px; display:flex; align-items:flex-start; justify-content:space-between; }
-  .title { font-size: 28px; font-weight:600; line-height:1.15; }
+  .header {
+    padding-top: calc(22px + env(safe-area-inset-top));
+    padding-left:20px; padding-right:20px; padding-bottom:14px;
+    display:flex; align-items:flex-start; justify-content:space-between;
+  }
+  .title { font-size: 27px; font-weight:600; line-height:1.3; padding-top:2px; }
   .iconbtn { width:38px; height:38px; border-radius:999px; border:1px solid var(--line); background:var(--surface); display:flex; align-items:center; justify-content:center; flex-shrink:0; }
   .iconbtn:active { transform: scale(0.95); }
-  .headerBtns { display:flex; gap:8px; }
+  .headerBtns { display:flex; gap:8px; margin-top:2px; }
   .tabs { display:flex; gap:8px; padding: 0 16px 12px; }
   .tab { flex:1; text-align:center; font-size:14px; font-weight:500; padding:7px 0; border-radius:999px; border:1px solid var(--line); background:var(--surface); color:var(--ink); font-family:'Lora', serif; }
   .tab.active { background:var(--ink); color:#fff; border-color:var(--ink); }
@@ -71,7 +75,7 @@
   .inline3 input[type=text] { flex:1; }
   .inline3 select { flex:0 0 auto; }
   ul.tasklist, ul.wlist { list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:6px; }
-  .taskrow, .wrow { display:flex; align-items:center; gap:8px; border:1px solid var(--line); border-radius:10px; padding:8px 12px; }
+  .taskrow, .wrow { display:flex; align-items:center; gap:8px; border:1px solid var(--line); border-radius:10px; padding:8px 12px; transition: opacity .25s ease; }
   .routineRow { border:1px solid var(--line); border-radius:10px; padding:10px 12px; }
   .checkbox { width:20px; height:20px; border-radius:6px; border:1px solid var(--line); display:flex; align-items:center; justify-content:center; flex-shrink:0; background:transparent; }
   .checkbox.checked { background:var(--ink); border-color:var(--ink); }
@@ -104,8 +108,6 @@
     0% { transform: translate(0,0) scale(0.5) rotate(0deg); opacity:1; }
     100% { transform: translate(var(--dx,0px), -46px) scale(1.15) rotate(25deg); opacity:0; }
   }
-  .pulse { animation: pulsePop .35s ease; }
-  @keyframes pulsePop { 0%{ transform:scale(1); } 40%{ transform:scale(1.18); } 100%{ transform:scale(1); } }
 </style>
 </head>
 <body>
@@ -146,7 +148,7 @@ var DAY_LETTERS = ['M','T','W','T','F','S','S'];
 var DAY_NAMES = ['Monday','Tuesday','Wednesday','Thursday','Friday','Saturday','Sunday'];
 
 var DEFAULT_DATA = {
-  schemaVersion: 3,
+  schemaVersion: 4,
   lastDate: todayKey(),
   water: { goal: 80, current: 0 },
   steps: { goal: 12000, hitToday: false },
@@ -169,6 +171,7 @@ var DEFAULT_DATA = {
     doneDates: {}
   },
   bills: { weekKey: todayKey(startOfWeekSunday()), paid: false },
+  billsHistory: [],
   history: []
 };
 
@@ -182,12 +185,8 @@ function snapshotDay(d, dateKey){
   };
 }
 
-/* ---------- load + migrate + rollover ---------- */
-function loadState(){
-  var raw = null;
-  try { raw = localStorage.getItem('fieldlog-data'); } catch(e) {}
-  var data = raw ? JSON.parse(raw) : JSON.parse(JSON.stringify(DEFAULT_DATA));
-
+/* ---------- migration (one-time structural upgrade) ---------- */
+function migrate(data){
   if (!data.history) data.history = [];
   if (!data.steps || data.steps.hitToday === undefined) {
     data.steps = { goal: (data.steps && data.steps.goal) || 12000, hitToday: false };
@@ -202,11 +201,9 @@ function loadState(){
     data.tasks = [];
   }
 
-  /* one-time structural migration to v3 */
   if (!data.schemaVersion || data.schemaVersion < 3) {
     if (!data.workout) data.workout = { goal:5, log:[] };
     data.workout.goal = 5;
-
     if (!data.routine) data.routine = JSON.parse(JSON.stringify(DEFAULT_DATA.routine));
     data.routine.items = (data.routine.items || []).map(function(it){
       var doneDates = it.doneDates ? it.doneDates.slice() : [];
@@ -216,18 +213,20 @@ function loadState(){
       return { id: it.id, label: it.label, doneDates: doneDates };
     });
     delete data.routine.completedToday;
-
     if (!data.cleaning) data.cleaning = JSON.parse(JSON.stringify(DEFAULT_DATA.cleaning));
-
     if (!data.bills) data.bills = { weekKey: todayKey(startOfWeekSunday()), paid:false };
-
-    data.schemaVersion = 3;
   }
   if (!data.cleaning) data.cleaning = JSON.parse(JSON.stringify(DEFAULT_DATA.cleaning));
   if (!data.cleaning.doneDates) data.cleaning.doneDates = {};
   if (!data.bills) data.bills = { weekKey: todayKey(startOfWeekSunday()), paid:false };
+  if (!data.billsHistory) data.billsHistory = [];
 
-  /* daily rollover (water / steps) */
+  data.schemaVersion = 4;
+  return data;
+}
+
+/* ---------- rollovers: daily (water/steps/recurring tasks) + weekly (bills) ---------- */
+function applyRollovers(data){
   var today = todayKey();
   if (data.lastDate !== today) {
     var snap = snapshotDay(data, data.lastDate);
@@ -242,16 +241,34 @@ function loadState(){
       return t;
     });
   }
-
-  /* weekly rollover (bills, resets Sunday) */
   var billsKey = todayKey(startOfWeekSunday());
   if (data.bills.weekKey !== billsKey) {
+    data.billsHistory = (data.billsHistory||[]).concat([{ weekKey: data.bills.weekKey, paid: data.bills.paid }]).slice(-26);
     data.bills = { weekKey: billsKey, paid: false };
   }
+  return data;
+}
 
+function loadState(){
+  var raw = null;
+  try { raw = localStorage.getItem('fieldlog-data'); } catch(e) {}
+  var data = raw ? JSON.parse(raw) : JSON.parse(JSON.stringify(DEFAULT_DATA));
+  data = migrate(data);
+  data = applyRollovers(data);
   return data;
 }
 function saveState(){ try { localStorage.setItem('fieldlog-data', JSON.stringify(state)); } catch(e) {} }
+
+/* re-check rollovers whenever the app becomes visible/focused again, since installed
+   home-screen apps don't reload their code automatically when resumed from background */
+function checkRollovers(){
+  var beforeLastDate = state.lastDate, beforeBillsKey = state.bills.weekKey;
+  state = applyRollovers(state);
+  if (state.lastDate !== beforeLastDate || state.bills.weekKey !== beforeBillsKey) {
+    saveState();
+  }
+  render();
+}
 
 /* ---------- state ---------- */
 var state = loadState();
@@ -260,6 +277,7 @@ var currentTab = 'today';
 var editingGoals = false;
 var showBackup = false;
 var restoreMsg = '';
+var pendingTaskRemoval = {};
 
 /* ---------- fun little celebration ---------- */
 function spawnBurst(x, y){
@@ -299,15 +317,9 @@ function addTask(text, recurrence){
     lastResetPeriodKey: recurrence!=='none' ? periodKeyFor(recurrence) : null });
   saveState(); render();
 }
-function toggleTask(id){
-  var nowDone = false;
-  state.tasks = state.tasks.map(function(t){
-    if (t.id!==id) return t;
-    nowDone = !t.done;
-    return Object.assign({},t,{done: nowDone});
-  });
-  saveState(); render();
-  return nowDone;
+function setTaskDone(id, done){
+  state.tasks = state.tasks.map(function(t){ return t.id===id ? Object.assign({},t,{done:done}) : t; });
+  saveState();
 }
 function deleteTask(id){ state.tasks = state.tasks.filter(function(t){return t.id!==id;}); saveState(); render(); }
 function setTaskRecurrence(id, recurrence){
@@ -359,7 +371,7 @@ function restoreBackup(text){
   try {
     var parsed = JSON.parse(text);
     if (!parsed || typeof parsed !== 'object') throw new Error('bad');
-    state = parsed; saveState(); restoreMsg = 'Restored! Your data is back.';
+    state = migrate(parsed); state = applyRollovers(state); saveState(); restoreMsg = 'Restored! Your data is back.';
   } catch(e) { restoreMsg = "That didn't look like a valid backup. Double-check you copied the whole thing."; }
   render();
 }
@@ -389,7 +401,7 @@ function cleaningSummary(items, doneDatesMap, start){
   var today = new Date(); today.setHours(0,0,0,0);
   var total=0, done=0;
   for (var d = new Date(start); d <= today; d.setDate(d.getDate()+1)) {
-    var isoDay = (d.getDay()+6)%7; // 0=Mon..6=Sun
+    var isoDay = (d.getDay()+6)%7;
     var dateStr = todayKey(d);
     items.forEach(function(it){
       if (it.day === isoDay) {
@@ -400,6 +412,12 @@ function cleaningSummary(items, doneDatesMap, start){
     });
   }
   return { done:done, total:total };
+}
+function billsSummary(start){
+  var weeks = (state.billsHistory||[]).concat([{ weekKey: state.bills.weekKey, paid: state.bills.paid }]);
+  var filtered = weeks.filter(function(w){ return new Date(w.weekKey) >= start; });
+  var paid = filtered.filter(function(w){return w.paid;}).length;
+  return { paid: paid, total: filtered.length };
 }
 
 /* ---------- icons (inline svg, minimal) ---------- */
@@ -432,6 +450,8 @@ function render(){
   monthSummary.routine = routineSummary(state.routine.items, monthStart);
   weekSummary.cleaning = cleaningSummary(state.cleaning.items, state.cleaning.doneDates, weekStart);
   monthSummary.cleaning = cleaningSummary(state.cleaning.items, state.cleaning.doneDates, monthStart);
+  weekSummary.bills = billsSummary(weekStart);
+  monthSummary.bills = billsSummary(monthStart);
 
   var dateLabel = new Date().toLocaleDateString(undefined,{weekday:'long', month:'short', day:'numeric'});
   var headerTitle = currentTab==='today' ? dateLabel : (currentTab==='week' ? 'This Week' : 'This Month');
@@ -483,7 +503,7 @@ function renderToday(){
   var weekStart = startOfWeek();
   var weekWorkouts = wk.log.filter(function(x){ return new Date(x.date) >= weekStart; });
   var waterPct = Math.min(100, Math.round((w.current / w.goal) * 100));
-  var todayWeekdayIdx = (new Date().getDay()+6)%7; // 0=Mon..6=Sun
+  var todayWeekdayIdx = (new Date().getDay()+6)%7;
 
   var html = '<div class="stack">';
 
@@ -584,6 +604,7 @@ function renderToday(){
     '</button></div>';
 
   /* TASKS */
+  var visibleTasks = state.tasks.filter(function(t){ return !t.done || pendingTaskRemoval[t.id]; });
   html += '<div class="card">';
   html += '<div class="row"><span class="sectionTitle display">Tasks</span><span class="xs muted">Stays until cleared</span></div>';
   html += '<div class="inline2"><input type="text" id="newTaskText" placeholder="Add a task" />';
@@ -591,12 +612,12 @@ function renderToday(){
   html += '<div class="recurPicker">'+icon('moon',COLORS.inkMuted)+'<select id="newTaskRecurrence">';
   RECURRENCE_OPTIONS.forEach(function(o){ html += '<option value="'+o[0]+'">'+o[1]+'</option>'; });
   html += '</select></div>';
-  if (!state.tasks.length) {
+  if (!visibleTasks.length) {
     html += '<p class="emptyMsg">No tasks yet. Add one above.</p>';
   } else {
     html += '<ul class="tasklist">';
-    state.tasks.forEach(function(t){
-      html += '<li class="taskrow">'+
+    visibleTasks.forEach(function(t){
+      html += '<li class="taskrow" style="'+(t.done?'opacity:0.45;':'')+'">'+
         '<button class="checkbox'+(t.done?' checked':'')+'" data-action="toggle-task" data-id="'+t.id+'">'+(t.done?icon('check','#fff'):'')+'</button>'+
         '<span class="small flex1'+(t.done?' strike':'')+'">'+escapeHtml(t.text)+'</span>'+
         '<select data-action="set-task-recurrence" data-id="'+t.id+'">';
@@ -655,6 +676,11 @@ function renderRollup(summary, entries, workouts, showDots){
   html += '<div class="row-left" style="margin-bottom:10px;">'+icon('sparkles',COLORS.cleaning)+'<span class="sectionTitle display">Cleaning</span></div>';
   html += '<div style="margin-bottom:8px;"><span class="bigNum">'+cleaningPct+'%</span><span class="bigNumLabel"> of rooms done</span></div>';
   html += '<div class="track" style="background:'+hexToRgba(COLORS.cleaning,0.18)+'"><div class="fill" style="width:'+cleaningPct+'%; background:'+COLORS.cleaning+'"></div></div>';
+  html += '</div>';
+
+  html += '<div class="card">';
+  html += '<div class="row-left" style="margin-bottom:10px;">'+icon('receipt',COLORS.bills)+'<span class="sectionTitle display">Bills</span></div>';
+  html += '<div><span class="bigNum">'+summary.bills.paid+'</span><span class="bigNumLabel"> / '+summary.bills.total+' weeks paid</span></div>';
   html += '</div>';
 
   html += '</div>';
@@ -723,8 +749,27 @@ document.getElementById('app').addEventListener('click', function(e){
       break;
     }
     case 'toggle-task': {
-      var done = toggleTask(el.getAttribute('data-id'));
-      if (done) spawnBurst(e.clientX, e.clientY);
+      var tid = el.getAttribute('data-id');
+      var task = state.tasks.filter(function(t){return t.id===tid;})[0];
+      if (!task) break;
+      if (!task.done) {
+        /* completing: show the cross-out briefly, then remove (or hide until its repeat comes due) */
+        pendingTaskRemoval[tid] = true;
+        setTaskDone(tid, true);
+        render();
+        spawnBurst(e.clientX, e.clientY);
+        (function(id){
+          setTimeout(function(){
+            delete pendingTaskRemoval[id];
+            var t2 = state.tasks.filter(function(x){return x.id===id;})[0];
+            if (t2 && t2.done && t2.recurrence === 'none') deleteTask(id);
+            else render();
+          }, 700);
+        })(tid);
+      } else {
+        setTaskDone(tid, false);
+        render();
+      }
       break;
     }
     case 'delete-task': deleteTask(el.getAttribute('data-id')); break;
@@ -775,6 +820,12 @@ document.getElementById('app').addEventListener('keydown', function(e){
 document.getElementById('app').addEventListener('focusin', function(e){
   if (e.target.id === 'backupOutput') e.target.select();
 });
+
+/* keep the date/reset logic fresh even when the installed app is just resumed, not reloaded */
+document.addEventListener('visibilitychange', function(){ if (!document.hidden) checkRollovers(); });
+window.addEventListener('pageshow', checkRollovers);
+window.addEventListener('focus', checkRollovers);
+setInterval(checkRollovers, 60000);
 
 render();
 </script>
